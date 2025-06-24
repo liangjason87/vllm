@@ -30,6 +30,7 @@ import os
 import random
 import time
 import warnings
+import requests
 from collections.abc import AsyncGenerator, Iterable
 from dataclasses import dataclass
 from datetime import datetime
@@ -73,6 +74,8 @@ from benchmark_dataset import (
     VisionArenaDataset,
 )
 from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
+from vllm.v1.metrics.reader import Metric, get_metrics_snapshot, Counter
+from prometheus_client.parser import text_string_to_metric_families
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
@@ -105,6 +108,8 @@ class BenchmarkMetrics:
     median_e2el_ms: float
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
+    mean_acceptance_len: float
+    acceptance_rate: float
 
 
 def _get_current_request_rate(
@@ -210,6 +215,7 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
+    base_url: str
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -250,6 +256,20 @@ def calculate_metrics(
             completed += 1
         else:
             actual_output_lens.append(0)
+    
+    response = requests.get(base_url + "/metrics")
+    num_drafts = num_accepted = num_draft_tokens = 0
+    if response.status_code == 200:
+        for metric in text_string_to_metric_families(response.text):
+            if metric.name == "vllm:spec_decode_num_drafts":
+                for sample in metric.samples:
+                    num_drafts += sample.value
+            elif metric.name == "vllm:spec_decode_num_accepted_tokens":
+                for sample in metric.samples:
+                    num_accepted += sample.value
+            elif metric.name == "vllm:spec_decode_num_draft_tokens":
+                for sample in metric.samples:
+                    num_draft_tokens += sample.value
 
     if goodput_config_dict:
         valid_metrics = []
@@ -315,6 +335,8 @@ def calculate_metrics(
         percentiles_e2el_ms=[
             (p, np.percentile(e2els or 0, p) * 1000) for p in selected_percentiles
         ],
+        mean_acceptance_len=round(1 + (num_accepted / num_drafts), 2) if num_accepted and num_drafts else 0,
+        acceptance_rate=round((num_accepted / num_draft_tokens) * 100, 2)
     )
 
     return metrics, actual_output_lens
@@ -516,6 +538,7 @@ async def benchmark(
         selected_percentile_metrics=selected_percentile_metrics,
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
+        base_url=base_url
     )
 
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -545,6 +568,18 @@ async def benchmark(
         )
     )
 
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Mean acceptance length:", metrics.mean_acceptance_len
+        )
+    )
+
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Acceptance rate:", metrics.acceptance_rate
+        )
+    )
+
     result = {
         "duration": benchmark_duration,
         "completed": metrics.completed,
@@ -553,6 +588,8 @@ async def benchmark(
         "request_throughput": metrics.request_throughput,
         "request_goodput:": metrics.request_goodput if goodput_config_dict else None,
         "output_throughput": metrics.output_throughput,
+        "mean_acceptance_len": metrics.mean_acceptance_len,
+        "acceptance_rate": metrics.acceptance_rate,
         "total_token_throughput": metrics.total_token_throughput,
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
