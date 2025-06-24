@@ -215,7 +215,10 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
-    base_url: str
+    base_url: str,
+    start_num_accepted: float,
+    start_num_draft_tokens: float,
+    start_num_drafts:float,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -270,6 +273,10 @@ def calculate_metrics(
             elif metric.name == "vllm:spec_decode_num_draft_tokens":
                 for sample in metric.samples:
                     num_draft_tokens += sample.value
+        # Calculate benchmark scoped metric
+        num_accepted -= start_num_accepted
+        num_drafts -= start_num_drafts
+        num_draft_tokens -= start_num_draft_tokens
 
     if goodput_config_dict:
         valid_metrics = []
@@ -335,8 +342,8 @@ def calculate_metrics(
         percentiles_e2el_ms=[
             (p, np.percentile(e2els or 0, p) * 1000) for p in selected_percentiles
         ],
-        mean_acceptance_len=round(1 + (num_accepted / num_drafts), 2) if num_accepted and num_drafts else 0,
-        acceptance_rate=round((num_accepted / num_draft_tokens) * 100, 2)
+        mean_acceptance_len=round(1 + (num_accepted / num_drafts), 2) if num_drafts else 0,
+        acceptance_rate=round((num_accepted / num_draft_tokens) * 100, 2) if num_draft_tokens else 0
     )
 
     return metrics, actual_output_lens
@@ -453,6 +460,20 @@ async def benchmark(
             return await request_func(request_func_input=request_func_input, pbar=pbar)
         async with semaphore:
             return await request_func(request_func_input=request_func_input, pbar=pbar)
+    
+    response = requests.get(base_url + "/metrics")
+    start_num_drafts = start_num_accepted = start_num_draft_tokens = 0
+    if response.status_code == 200:
+        for metric in text_string_to_metric_families(response.text):
+            if metric.name == "vllm:spec_decode_num_drafts":
+                for sample in metric.samples:
+                    start_num_drafts += sample.value
+            elif metric.name == "vllm:spec_decode_num_accepted_tokens":
+                for sample in metric.samples:
+                    start_num_accepted += sample.value
+            elif metric.name == "vllm:spec_decode_num_draft_tokens":
+                for sample in metric.samples:
+                    start_num_draft_tokens += sample.value
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
@@ -538,7 +559,10 @@ async def benchmark(
         selected_percentile_metrics=selected_percentile_metrics,
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
-        base_url=base_url
+        base_url=base_url,
+        start_num_accepted=start_num_accepted,
+        start_num_draft_tokens=start_num_draft_tokens,
+        start_num_drafts=start_num_drafts
     )
 
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
