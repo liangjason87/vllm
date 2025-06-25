@@ -89,6 +89,7 @@ class BenchmarkMetrics:
     request_goodput: float
     output_throughput: float
     total_token_throughput: float
+    gen_tokens_sec_client: float
     mean_ttft_ms: float
     median_ttft_ms: float
     std_ttft_ms: float
@@ -219,6 +220,7 @@ def calculate_metrics(
     start_num_accepted: float,
     start_num_draft_tokens: float,
     start_num_drafts:float,
+    backend: str,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -259,24 +261,38 @@ def calculate_metrics(
             completed += 1
         else:
             actual_output_lens.append(0)
-    
-    response = requests.get(base_url + "/metrics")
+
     num_drafts = num_accepted = num_draft_tokens = 0
-    if response.status_code == 200:
-        for metric in text_string_to_metric_families(response.text):
-            if metric.name == "vllm:spec_decode_num_drafts":
-                for sample in metric.samples:
-                    num_drafts += sample.value
-            elif metric.name == "vllm:spec_decode_num_accepted_tokens":
-                for sample in metric.samples:
-                    num_accepted += sample.value
-            elif metric.name == "vllm:spec_decode_num_draft_tokens":
-                for sample in metric.samples:
-                    num_draft_tokens += sample.value
-        # Calculate benchmark scoped metric
-        num_accepted -= start_num_accepted
-        num_drafts -= start_num_drafts
-        num_draft_tokens -= start_num_draft_tokens
+
+    if "sglang" == backend:
+        server_info = requests.get(base_url + "/get_server_info")
+        if server_info.status_code == 200:
+            server_info_json = server_info.json()
+            if "decode" in server_info_json:
+                server_info_json = server_info_json["decode"][0]
+            accept_length = server_info_json["internal_states"][0].get(
+                "avg_spec_accept_length", None
+            )
+        else:
+            accept_length = None
+    else:
+        response = requests.get(base_url + "/metrics")
+        if response.status_code == 200:
+            for metric in text_string_to_metric_families(response.text):
+                if metric.name == "vllm:spec_decode_num_drafts":
+                    for sample in metric.samples:
+                        num_drafts += sample.value
+                elif metric.name == "vllm:spec_decode_num_accepted_tokens":
+                    for sample in metric.samples:
+                        num_accepted += sample.value
+                elif metric.name == "vllm:spec_decode_num_draft_tokens":
+                    for sample in metric.samples:
+                        num_draft_tokens += sample.value
+            # Calculate benchmark scoped metric
+            num_accepted -= start_num_accepted
+            num_drafts -= start_num_drafts
+            num_draft_tokens -= start_num_draft_tokens
+        accept_length = round(1 + (num_accepted / num_drafts), 2) if num_drafts else None
 
     if goodput_config_dict:
         valid_metrics = []
@@ -317,6 +333,7 @@ def calculate_metrics(
         request_goodput=good_completed / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
+        gen_tokens_sec_client=round(sum(actual_output_lens) / dur_s / max_concurrency),
         mean_ttft_ms=np.mean(ttfts or 0)
         * 1000,  # ttfts is empty if streaming is not supported by backend
         std_ttft_ms=np.std(ttfts or 0) * 1000,
@@ -342,8 +359,8 @@ def calculate_metrics(
         percentiles_e2el_ms=[
             (p, np.percentile(e2els or 0, p) * 1000) for p in selected_percentiles
         ],
-        mean_acceptance_len=round(1 + (num_accepted / num_drafts), 2) if num_drafts else 0,
-        acceptance_rate=round((num_accepted / num_draft_tokens) * 100, 2) if num_draft_tokens else 0
+        mean_acceptance_len=accept_length,
+        acceptance_rate=round((num_accepted / num_draft_tokens) * 100, 2) if num_draft_tokens else None
     )
 
     return metrics, actual_output_lens
@@ -562,7 +579,8 @@ async def benchmark(
         base_url=base_url,
         start_num_accepted=start_num_accepted,
         start_num_draft_tokens=start_num_draft_tokens,
-        start_num_drafts=start_num_drafts
+        start_num_drafts=start_num_drafts,
+        backend=backend
     )
 
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
@@ -592,17 +610,19 @@ async def benchmark(
         )
     )
 
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Mean acceptance length:", metrics.mean_acceptance_len
+    if metrics.mean_acceptance_len:
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Mean acceptance length:", metrics.mean_acceptance_len
+            )
         )
-    )
 
-    print(
-        "{:<40} {:<10.2f}".format(
-            "Acceptance rate:", metrics.acceptance_rate
+    if metrics.acceptance_rate:
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Acceptance rate:", metrics.acceptance_rate
+            )
         )
-    )
 
     result = {
         "duration": benchmark_duration,
@@ -615,6 +635,7 @@ async def benchmark(
         "mean_acceptance_len": metrics.mean_acceptance_len,
         "acceptance_rate": metrics.acceptance_rate,
         "total_token_throughput": metrics.total_token_throughput,
+        "gen_tokens_sec_client": metrics.gen_tokens_sec_client,
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
