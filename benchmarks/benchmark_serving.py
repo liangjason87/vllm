@@ -221,6 +221,7 @@ def calculate_metrics(
     start_num_draft_tokens: float,
     start_num_drafts:float,
     backend: str,
+    max_concurrency: float,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -580,7 +581,8 @@ async def benchmark(
         start_num_accepted=start_num_accepted,
         start_num_draft_tokens=start_num_draft_tokens,
         start_num_drafts=start_num_drafts,
-        backend=backend
+        backend=backend,
+        max_concurrency=max_concurrency
     )
 
     print("{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
